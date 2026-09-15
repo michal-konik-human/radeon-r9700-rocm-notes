@@ -1,0 +1,10 @@
+[Unit]
+Description=Collect root-only NVMe SMART values for the netdata amdgpu plugin
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/smart-helper
+ProtectSystem=strict
+ReadWritePaths=/run
+PrivateNetwork=yes
+NoNewPrivileges=yes

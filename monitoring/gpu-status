@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""
+gpu-status - one screen with the health of every AMD GPU and the host around it.
+
+Works from any shell and over SSH; no shell quoting involved, which is why this is a
+standalone script rather than a shell function.
+
+Reads GPU telemetry via amd-smi, NOT sysfs - an idle discrete card returns EBUSY from
+sysfs. Everything is auto-detected; nothing is hardcoded.
+
+License: MIT
+"""
+
+import json
+import shutil
+import subprocess
+import sys
+
+NETDATA = "http://127.0.0.1:19999"
+
+C_RESET, C_DIM = "\033[0m", "\033[2m"
+C_OK, C_WARN, C_CRIT, C_HEAD = "\033[32m", "\033[33m", "\033[31m", "\033[1;36m"
+
+
+def colour(on, code, text):
+    return f"{code}{text}{C_RESET}" if on else text
+
+
+def head(title, tty):
+    print(colour(tty, C_HEAD, f"── {title} " + "─" * max(4, 52 - len(title))))
+
+
+def run(cmd, timeout=20):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout).stdout
+    except Exception:
+        return ""
+
+
+def run_json(cmd, timeout=20):
+    raw = run(cmd, timeout)
+    if not raw.strip():
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def dsec(node, name):
+    """amd-smi returns a bare 'N/A' string instead of a dict for some sections."""
+    if not isinstance(node, dict):
+        return {}
+    v = node.get(name)
+    return v if isinstance(v, dict) else {}
+
+
+def val(x, default="-"):
+    if isinstance(x, dict):
+        x = x.get("value")
+    return default if x in (None, "N/A") else x
+
+
+def temp_colour(t, warn, crit):
+    try:
+        t = float(t)
+    except (TypeError, ValueError):
+        return C_DIM
+    return C_CRIT if t >= crit else (C_WARN if t >= warn else C_OK)
+
+
+def gpu_section(tty):
+    head("GPU", tty)
+    data = run_json(["amd-smi", "metric", "--json"], timeout=25)
+    if not data or not data.get("gpu_data"):
+        print("  amd-smi not responding")
+        return
+    static = run_json(["amd-smi", "static", "--json"], timeout=25) or {}
+    names = {e.get("gpu"): str(val(dsec(e, "asic").get("market_name"), "GPU"))
+             for e in static.get("gpu_data", [])}
+
+    for g in data["gpu_data"]:
+        i = g.get("gpu")
+        t, p, f = dsec(g, "temperature"), dsec(g, "power"), dsec(g, "fan")
+        u, m, ecc = dsec(g, "usage"), dsec(g, "mem_usage"), dsec(g, "ecc")
+        edge, junc, vramt = (val(t.get("edge")), val(t.get("hotspot")),
+                             val(t.get("mem")))
+        # GDDR6 degrades permanently above 100 C, so its warn threshold is lower.
+        print(f"  GPU{i} {names.get(i, 'GPU')[:26]:<26}  "
+              + "edge " + colour(tty, temp_colour(edge, 85, 95), f"{edge:>4}C") + "  "
+              + "junction " + colour(tty, temp_colour(junc, 90, 100), f"{junc:>4}C") + "  "
+              + "vram " + colour(tty, temp_colour(vramt, 85, 95), f"{vramt:>4}C"))
+        print(f"       {val(p.get('socket_power')):>4}W   "
+              f"fan {val(f.get('rpm')):>5} rpm   "
+              f"gfx {val(u.get('gfx_activity')):>3}%   "
+              f"vram {val(m.get('used_vram')):>6}/{val(m.get('total_vram'))} MB")
+        unc = val(ecc.get("total_uncorrectable_count"), 0)
+        cor = val(ecc.get("total_correctable_count"), 0)
+        print("       " + colour(tty, C_CRIT if unc not in (0, "-") else C_DIM,
+                                 f"ECC corr {cor} / uncorr {unc}"))
+
+
+def host_section(tty):
+    head("host", tty)
+    s = run_json(["sensors", "-j"]) or {}
+    for adapter, body in s.items():
+        if not isinstance(body, dict):
+            continue
+        if adapter.startswith(("k10temp", "coretemp")):
+            for k, sub in body.items():
+                if isinstance(sub, dict):
+                    for field, v in sub.items():
+                        if field.endswith("_input"):
+                            print(f"  CPU {k:<12} "
+                                  + colour(tty, temp_colour(v, 85, 92), f"{v:.1f}C"))
+                            break
+        elif adapter.startswith("nvme-pci"):
+            sub = body.get("Composite")
+            if isinstance(sub, dict) and sub.get("temp1_input") is not None:
+                v = sub["temp1_input"]
+                print("  NVMe             "
+                      + colour(tty, temp_colour(v, 70, 80), f"{v:.1f}C"))
+
+    df = run(["df", "-h", "/"]).strip().splitlines()
+    if len(df) > 1:
+        c = df[-1].split()
+        print(f"  disk /           {c[2]} of {c[1]} ({c[4]})")
+
+    try:
+        with open("/run/amdgpu-plugin-smart.json") as fh:
+            sm = json.load(fh).get("nvme", {})
+        if sm:
+            cw = sm.get("critical_warning", 0)
+            print("  NVMe SMART       " + colour(
+                tty, C_CRIT if cw else C_OK,
+                f"wear {sm.get('percentage_used', '-')}%, "
+                f"media errors {sm.get('media_errors', '-')}, "
+                f"critical_warning {cw}"))
+    except Exception:
+        pass
+
+
+def alarms_section(tty):
+    head("netdata alerts", tty)
+    if not shutil.which("curl"):
+        print("  curl not available")
+        return
+    # ?all is required: the plain endpoint returns ONLY currently-firing alarms, so
+    # counting its rows tells you nothing about how many rules are armed.
+    data = run_json(["curl", "-sS", "--max-time", "8",
+                     f"{NETDATA}/api/v1/alarms?all"])
+    if data is None:
+        print("  netdata not responding")
+        return
+    alarms = data.get("alarms", {})
+    bad = {k: v for k, v in alarms.items()
+           if v.get("status") in ("WARNING", "CRITICAL")}
+    if not bad:
+        print("  " + colour(tty, C_OK, "all clear")
+              + f"  ({len(alarms)} rules armed)")
+        return
+    print("  " + colour(tty, C_WARN, f"active alerts: {len(bad)}"))
+    for k, v in sorted(bad.items()):
+        code = C_CRIT if v["status"] == "CRITICAL" else C_WARN
+        print("   " + colour(tty, code, f"{v['status']:8s} {k}")
+              + f"  = {v.get('value_string', '')}")
+
+
+def main():
+    tty = sys.stdout.isatty()
+    gpu_section(tty)
+    host_section(tty)
+    alarms_section(tty)
+
+
+if __name__ == "__main__":
+    main()

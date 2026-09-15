@@ -1,0 +1,58 @@
+#!/bin/bash
+# smart-helper - collects the few NVMe health values that genuinely need root and
+# writes them to /run/amdgpu-plugin-smart.json for amdgpu.plugin (which runs as the
+# unprivileged netdata user) to read.
+#
+# Kept deliberately tiny and read-only: NVMe SMART attributes only. Everything else
+# the collector reports (GPU metrics, temperatures, PCIe AER counters) is readable
+# without privilege and is collected directly by the plugin.
+#
+# NVMe wear changes over days, so run this on a timer every 15 minutes, not at
+# netdata's sampling rate. Install:
+#
+#   sudo install -o root -g root -m 0755 smart-helper /usr/local/sbin/smart-helper
+#   sudo install -m 0644 smart-helper.service smart-helper.timer /etc/systemd/system/
+#   sudo systemctl enable --now smart-helper.timer
+#
+# License: MIT
+
+set -uo pipefail
+
+OUT=/run/amdgpu-plugin-smart.json
+DEV="${SMART_DEVICE:-/dev/nvme0}"
+TMP="$(mktemp /run/amdgpu-plugin-smart.XXXXXX)"
+trap 'rm -f "$TMP"' EXIT
+
+emit_empty() { printf '{"generated":"%s","nvme":{}}\n' "$(date -Is)" > "$TMP"; }
+
+if [[ ! -e "$DEV" ]]; then
+    emit_empty
+elif smart=$(nvme smart-log "$DEV" -o json 2>/dev/null) && [[ -n "$smart" ]]; then
+    printf '%s' "$smart" | python3 -c '
+import json, sys, datetime
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+out = {
+    "percentage_used":  d.get("percent_used", d.get("percentage_used")),
+    "media_errors":     d.get("media_errors"),
+    "critical_warning": d.get("critical_warning"),
+    "unsafe_shutdowns": d.get("unsafe_shutdowns"),
+    "power_on_hours":   d.get("power_on_hours"),
+}
+cw = out["critical_warning"]
+if isinstance(cw, dict):                      # some drives report a dict of flags
+    out["critical_warning"] = 1 if any(cw.values()) else 0
+print(json.dumps({
+    "generated": datetime.datetime.now().astimezone().isoformat(),
+    "nvme": {k: v for k, v in out.items() if v is not None},
+}))
+' > "$TMP" 2>/dev/null || emit_empty
+else
+    emit_empty
+fi
+
+chmod 0644 "$TMP"
+mv -f "$TMP" "$OUT"
+trap - EXIT

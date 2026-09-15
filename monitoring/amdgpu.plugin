@@ -1,0 +1,489 @@
+#!/usr/bin/env python3
+"""
+amdgpu.plugin — a netdata collector for discrete AMD GPUs that actually works.
+
+WHY THIS EXISTS
+
+netdata's built-in amdgpu collector reads sysfs hwmon. A discrete card with no display
+attached gets parked in D3hot by runtime power management, and sysfs reads then return
+EBUSY. netdata does not report an error — it simply **does not create the chart**.
+
+The practical result on my machine: full temperature / power / fan / clock charts for the
+harmless integrated GPU, and *memory charts only* for the discrete card. The one component
+that can physically burn was unmonitored, and the dashboard looked healthy.
+
+This collector reads through `amd-smi`, which wakes the card by a different path and always
+returns real values.
+
+IDLE POWER
+
+Polling amd-smi wakes the card (~15 W per card). So this first reads
+`power/runtime_status` — a cheap read that does NOT wake it — and only calls amd-smi when
+the card is already active. A suspended card is cold and drawing almost nothing, so there
+is nothing to protect it from. The `powerstate` chart shows which state each card is in,
+so a gap in the temperature chart is explained rather than mysterious.
+
+PCIe AER counters are read unconditionally, even while the card sleeps: a link throwing
+errors must not become invisible just because the GPU is idle.
+
+COLLECTED, PER GPU
+
+  edge / hotspot (junction) / memory (GDDR6) temperature, socket power, fan RPM and duty,
+  gfx and memory clocks, gfx and memory-controller activity, VRAM used, ECC
+  correctable/uncorrectable, PCIe link width, throttle flag, runtime power state, and a
+  derived cooling-fault metric (fan stopped while hot).
+
+PLUS, SYSTEM-WIDE
+
+  CPU package temperatures, NVMe composite temperature, NIC controller temperatures
+  (via lm-sensors), and NVMe SMART wear/errors if a helper writes them to
+  /run/amdgpu-plugin-smart.json (SMART needs root; this plugin does not).
+
+INSTALL
+
+  sudo install -o root -g root -m 0755 amdgpu.plugin \\
+      /usr/lib/netdata/plugins.d/amdgpu.plugin
+  # netdata.conf:  [plugins]  amdgpu = yes
+  # and disable the built-in one:  [plugin:proc]  /sys/class/drm = no
+  sudo usermod -aG video,render netdata     # amd-smi needs GPU device access
+  sudo systemctl restart netdata
+
+License: MIT
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+
+UPDATE_EVERY = int(sys.argv[1]) if len(sys.argv) > 1 else 5
+SMART_FILE = "/run/amdgpu-plugin-smart.json"
+
+# Junction temperature above which a fan reading 0 RPM is treated as a cooling fault
+# rather than normal zero-fan-stop idling. These cards idle around 30 C with the fan
+# stopped and spin up well before 70 C under any real load.
+FAN_STALL_TEMP_C = 70
+
+# lm-sensors adapter names are PCI-address based and therefore change when a card is
+# added (PCI renumbering). Discover them by prefix instead of hardcoding.
+SENSOR_PREFIXES = {"cpu": ("k10temp", "coretemp"), "nvme": ("nvme-pci",),
+                   "nic": ("enp", "eth")}
+
+
+def log(msg):
+    sys.stderr.write(f"amdgpu.plugin: {msg}\n")
+    sys.stderr.flush()
+
+
+def out(line):
+    sys.stdout.write(line + "\n")
+
+
+def flush():
+    sys.stdout.flush()
+
+
+def run_json(cmd, timeout=20):
+    try:
+        p = subprocess.run(cmd, capture_output=True, timeout=timeout, text=True)
+        if not p.stdout.strip():
+            return None
+        return json.loads(p.stdout)
+    except Exception:
+        return None
+
+
+def dsec(node, name):
+    """Fetch a sub-section as a dict.
+
+    amd-smi is not uniformly shaped across GPUs: for an integrated GPU several sections
+    (e.g. "power") come back as the bare string "N/A" instead of a dict. A plain
+    `.get(name, {}) or {}` keeps that string and the next `.get()` raises AttributeError,
+    killing the collection loop mid-cycle — which silently drops every chart defined
+    after it.
+    """
+    if not isinstance(node, dict):
+        return {}
+    v = node.get(name)
+    return v if isinstance(v, dict) else {}
+
+
+def leaf(node):
+    if isinstance(node, dict):
+        node = node.get("value")
+    return None if node in (None, "N/A") else node
+
+
+def as_int(node):
+    v = leaf(node)
+    if v is None:
+        return None
+    try:
+        return int(round(float(v)))
+    except (TypeError, ValueError):
+        return None
+
+
+def read_first(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+# ------------------------------------------------------------- GPU inventory
+
+def gpu_inventory():
+    """index -> {bdf, name, gfx, sysfs}. Done once at startup, auto-detected."""
+    static = run_json(["amd-smi", "static", "--json"], timeout=30)
+    if not static:
+        return {}
+    inv = {}
+    for entry in static.get("gpu_data", []):
+        idx = entry.get("gpu")
+        asic, bus = dsec(entry, "asic"), dsec(entry, "bus")
+        bdf = leaf(bus.get("bdf")) or ""
+        inv[idx] = {
+            "bdf": bdf,
+            "name": str(leaf(asic.get("market_name")) or f"GPU {idx}"),
+            "gfx": str(leaf(asic.get("target_graphics_version")) or ""),
+            "sysfs": f"/sys/bus/pci/devices/{bdf}" if bdf else None,
+        }
+    return inv
+
+
+def runtime_suspended(sysfs):
+    """True if the card is runtime-suspended. Cheap read; does NOT wake the card."""
+    if not sysfs:
+        return False
+    return read_first(os.path.join(sysfs, "power/runtime_status")) == "suspended"
+
+
+def aer_counts(sysfs):
+    """PCIe AER counters straight from sysfs. No root needed, works while suspended."""
+    res = {}
+    for kind in ("correctable", "nonfatal", "fatal"):
+        total = None
+        if sysfs:
+            raw = read_first(os.path.join(sysfs, f"aer_dev_{kind}"))
+            if raw:
+                total = 0
+                for line in raw.splitlines():
+                    parts = line.split()
+                    if len(parts) == 2:
+                        try:
+                            total += int(parts[1])
+                        except ValueError:
+                            pass
+        res[kind] = total
+    return res
+
+
+# --------------------------------------------------------- chart definitions
+
+def define_gpu_charts(idx, meta):
+    fam = f"gpu{idx} {meta['name']}"
+    pri = 1000 + idx * 100
+    g = f"amdgpu_gpu{idx}"
+
+    # Temperature first: it is the metric that protects the hardware.
+    out(f"CHART {g}.temperature '' 'GPU {idx} temperatures ({meta['name']})' 'Celsius' "
+        f"'{fam}' amdgpu.temperature line {pri} {UPDATE_EVERY}")
+    out("DIMENSION edge edge absolute 1 1")
+    out("DIMENSION hotspot 'hotspot (junction)' absolute 1 1")
+    out("DIMENSION mem 'memory (GDDR6)' absolute 1 1")
+
+    out(f"CHART {g}.power '' 'GPU {idx} power draw' 'Watts' '{fam}' "
+        f"amdgpu.power area {pri + 1} {UPDATE_EVERY}")
+    out("DIMENSION socket 'socket power' absolute 1 1")
+
+    out(f"CHART {g}.fan '' 'GPU {idx} fan' 'RPM' '{fam}' "
+        f"amdgpu.fan line {pri + 2} {UPDATE_EVERY}")
+    out("DIMENSION rpm rpm absolute 1 1")
+
+    out(f"CHART {g}.fan_pct '' 'GPU {idx} fan duty' 'percent' '{fam}' "
+        f"amdgpu.fan_pct line {pri + 3} {UPDATE_EVERY}")
+    out("DIMENSION usage duty absolute 1 100")
+
+    out(f"CHART {g}.clocks '' 'GPU {idx} clocks' 'MHz' '{fam}' "
+        f"amdgpu.clocks line {pri + 4} {UPDATE_EVERY}")
+    out("DIMENSION gfx gfx absolute 1 1")
+    out("DIMENSION mem memory absolute 1 1")
+
+    out(f"CHART {g}.activity '' 'GPU {idx} activity' 'percent' '{fam}' "
+        f"amdgpu.activity line {pri + 5} {UPDATE_EVERY}")
+    out("DIMENSION gfx graphics absolute 1 1")
+    out("DIMENSION umc 'memory controller' absolute 1 1")
+
+    out(f"CHART {g}.vram '' 'GPU {idx} VRAM used' 'MiB' '{fam}' "
+        f"amdgpu.vram area {pri + 6} {UPDATE_EVERY}")
+    out("DIMENSION used used absolute 1 1")
+
+    # ECC and AER are the two "something is physically wrong" counters.
+    out(f"CHART {g}.ecc '' 'GPU {idx} ECC errors (cumulative)' 'errors' '{fam}' "
+        f"amdgpu.ecc line {pri + 7} {UPDATE_EVERY}")
+    out("DIMENSION correctable correctable absolute 1 1")
+    out("DIMENSION uncorrectable uncorrectable absolute 1 1")
+
+    out(f"CHART {g}.aer '' 'GPU {idx} PCIe AER errors (cumulative)' 'errors' '{fam}' "
+        f"amdgpu.aer line {pri + 8} {UPDATE_EVERY}")
+    out("DIMENSION correctable correctable absolute 1 1")
+    out("DIMENSION nonfatal nonfatal absolute 1 1")
+    out("DIMENSION fatal fatal absolute 1 1")
+
+    out(f"CHART {g}.pcie_width '' 'GPU {idx} PCIe link width' 'lanes' '{fam}' "
+        f"amdgpu.pcie_width line {pri + 9} {UPDATE_EVERY}")
+    out("DIMENSION width lanes absolute 1 1")
+
+    out(f"CHART {g}.throttled '' 'GPU {idx} throttled' 'boolean' '{fam}' "
+        f"amdgpu.throttled line {pri + 10} {UPDATE_EVERY}")
+    out("DIMENSION throttled throttled absolute 1 1")
+
+    out(f"CHART {g}.powerstate '' 'GPU {idx} power state (1=active, 0=suspended)' "
+        f"'state' '{fam}' amdgpu.powerstate line {pri + 11} {UPDATE_EVERY}")
+    out("DIMENSION active active absolute 1 1")
+
+    # Derived: a stopped fan on a hot card is the clearest "act now or lose the card"
+    # signal there is. Computed here because the plugin sees fan RPM and junction
+    # temperature in the same sample — expressing it as a cross-chart health
+    # expression would be fragile.
+    out(f"CHART {g}.cooling_fault '' 'GPU {idx} cooling fault (fan stopped while hot)' "
+        f"'boolean' '{fam}' amdgpu.cooling_fault line {pri + 12} {UPDATE_EVERY}")
+    out("DIMENSION fault fault absolute 1 1")
+
+
+def define_system_charts():
+    out(f"CHART amdgpu_host.cpu_temperature '' 'CPU temperatures' 'Celsius' 'host' "
+        f"amdgpu.cpu_temperature line 500 {UPDATE_EVERY}")
+    out("DIMENSION pkg 'package/Tctl' absolute 1 1000")
+    out("DIMENSION die 'die/Tccd1' absolute 1 1000")
+
+    out(f"CHART amdgpu_host.nvme_temperature '' 'NVMe temperature' 'Celsius' 'host' "
+        f"amdgpu.nvme_temperature line 600 {UPDATE_EVERY}")
+    out("DIMENSION composite composite absolute 1 1000")
+
+    out(f"CHART amdgpu_host.nvme_health '' 'NVMe SMART health' 'value' 'host' "
+        f"amdgpu.nvme_health line 601 {UPDATE_EVERY}")
+    out("DIMENSION percentage_used 'wear used %' absolute 1 1")
+    out("DIMENSION media_errors 'media errors' absolute 1 1")
+    out("DIMENSION critical_warning 'critical warning' absolute 1 1")
+
+    out(f"CHART amdgpu_host.nic_temperature '' 'NIC controller temperatures' 'Celsius' "
+        f"'host' amdgpu.nic_temperature line 700 {UPDATE_EVERY}")
+    out("DIMENSION nic0 nic0 absolute 1 1000")
+    out("DIMENSION nic1 nic1 absolute 1 1000")
+
+
+# ------------------------------------------------------------------ collection
+
+def collect_sensors():
+    """CPU / NVMe / NIC temperatures via `sensors -j` (no root needed)."""
+    data = run_json(["sensors", "-j"])
+    res = {"pkg": None, "die": None, "nvme": None, "nics": []}
+    if not data:
+        return res
+    for adapter, body in data.items():
+        if not isinstance(body, dict):
+            continue
+        if adapter.startswith(SENSOR_PREFIXES["cpu"]):
+            for key, sub in body.items():
+                if not isinstance(sub, dict):
+                    continue
+                low = key.lower()
+                if low in ("tctl", "package id 0"):
+                    res["pkg"] = sub.get("temp1_input")
+                elif low in ("tccd1", "core 0"):
+                    res["die"] = sub.get("temp3_input", sub.get("temp2_input"))
+        elif adapter.startswith(SENSOR_PREFIXES["nvme"]):
+            sub = body.get("Composite")
+            if isinstance(sub, dict):
+                res["nvme"] = sub.get("temp1_input")
+        elif adapter.startswith(SENSOR_PREFIXES["nic"]):
+            for _, sub in body.items():
+                if isinstance(sub, dict):
+                    for field, v in sub.items():
+                        if field.endswith("_input"):
+                            res["nics"].append(v)
+                            break
+    return res
+
+
+def collect_smart():
+    try:
+        with open(SMART_FILE) as f:
+            return json.load(f).get("nvme", {})
+    except Exception:
+        return {}
+
+
+def main():
+    inv = gpu_inventory()
+    if not inv:
+        log("amd-smi returned no GPUs; GPU charts disabled")
+    for idx in sorted(inv):
+        define_gpu_charts(idx, inv[idx])
+    define_system_charts()
+    flush()
+
+    while True:
+        started = time.time()
+
+        # Only wake a card that is already awake. Suspended cards are cold.
+        active = {i: not runtime_suspended(m["sysfs"]) for i, m in inv.items()}
+        metrics = run_json(["amd-smi", "metric", "--json"], timeout=25) \
+            if any(active.values()) else None
+        by_idx = {}
+        if metrics:
+            for entry in metrics.get("gpu_data", []):
+                by_idx[entry.get("gpu")] = entry
+
+        for idx, meta in sorted(inv.items()):
+            g = f"amdgpu_gpu{idx}"
+
+            out(f"BEGIN {g}.powerstate")
+            out(f"SET active = {1 if active.get(idx) else 0}")
+            out("END")
+
+            # Read unconditionally: a link throwing errors must not become invisible
+            # just because the card happens to be idle.
+            aer = aer_counts(meta["sysfs"])
+            if any(v is not None for v in aer.values()):
+                out(f"BEGIN {g}.aer")
+                for kind in ("correctable", "nonfatal", "fatal"):
+                    if aer[kind] is not None:
+                        out(f"SET {kind} = {aer[kind]}")
+                out("END")
+
+            entry = by_idx.get(idx)
+            if not active.get(idx) or not isinstance(entry, dict):
+                continue
+
+            temp = dsec(entry, "temperature")
+            vals = {k: as_int(temp.get(k)) for k in ("edge", "hotspot", "mem")}
+            if any(v is not None for v in vals.values()):
+                out(f"BEGIN {g}.temperature")
+                for k, v in vals.items():
+                    if v is not None:
+                        out(f"SET {k} = {v}")
+                out("END")
+
+            power = dsec(entry, "power")
+            sp = as_int(power.get("socket_power"))
+            if sp is not None:
+                out(f"BEGIN {g}.power")
+                out(f"SET socket = {sp}")
+                out("END")
+
+            thr = leaf(power.get("throttle_status"))
+            if thr is not None:
+                out(f"BEGIN {g}.throttled")
+                out(f"SET throttled = {0 if str(thr).upper() == 'UNTHROTTLED' else 1}")
+                out("END")
+
+            fan = dsec(entry, "fan")
+            rpm = as_int(fan.get("rpm"))
+            if rpm is not None:
+                out(f"BEGIN {g}.fan")
+                out(f"SET rpm = {rpm}")
+                out("END")
+            usage = leaf(fan.get("usage"))
+            if usage is not None:
+                try:
+                    out(f"BEGIN {g}.fan_pct")
+                    out(f"SET usage = {int(round(float(usage) * 100))}")
+                    out("END")
+                except (TypeError, ValueError):
+                    pass
+
+            hot = vals.get("hotspot")
+            if rpm is not None and hot is not None:
+                out(f"BEGIN {g}.cooling_fault")
+                out(f"SET fault = {1 if (rpm == 0 and hot >= FAN_STALL_TEMP_C) else 0}")
+                out("END")
+
+            clock = dsec(entry, "clock")
+            gfx = as_int(dsec(clock, "gfx_0").get("clk"))
+            mem = as_int(dsec(clock, "mem_0").get("clk"))
+            if gfx is not None or mem is not None:
+                out(f"BEGIN {g}.clocks")
+                if gfx is not None:
+                    out(f"SET gfx = {gfx}")
+                if mem is not None:
+                    out(f"SET mem = {mem}")
+                out("END")
+
+            use = dsec(entry, "usage")
+            ga, ua = as_int(use.get("gfx_activity")), as_int(use.get("umc_activity"))
+            if ga is not None or ua is not None:
+                out(f"BEGIN {g}.activity")
+                if ga is not None:
+                    out(f"SET gfx = {ga}")
+                if ua is not None:
+                    out(f"SET umc = {ua}")
+                out("END")
+
+            used = as_int(dsec(entry, "mem_usage").get("used_vram"))
+            if used is not None:
+                out(f"BEGIN {g}.vram")
+                out(f"SET used = {used}")
+                out("END")
+
+            ecc = dsec(entry, "ecc")
+            ec = as_int(ecc.get("total_correctable_count"))
+            eu = as_int(ecc.get("total_uncorrectable_count"))
+            if ec is not None or eu is not None:
+                out(f"BEGIN {g}.ecc")
+                if ec is not None:
+                    out(f"SET correctable = {ec}")
+                if eu is not None:
+                    out(f"SET uncorrectable = {eu}")
+                out("END")
+
+            w = as_int(dsec(entry, "pcie").get("width"))
+            if w is not None:
+                out(f"BEGIN {g}.pcie_width")
+                out(f"SET width = {w}")
+                out("END")
+
+        s = collect_sensors()
+        if s["pkg"] is not None or s["die"] is not None:
+            out("BEGIN amdgpu_host.cpu_temperature")
+            if s["pkg"] is not None:
+                out(f"SET pkg = {int(round(float(s['pkg']) * 1000))}")
+            if s["die"] is not None:
+                out(f"SET die = {int(round(float(s['die']) * 1000))}")
+            out("END")
+        if s["nvme"] is not None:
+            out("BEGIN amdgpu_host.nvme_temperature")
+            out(f"SET composite = {int(round(float(s['nvme']) * 1000))}")
+            out("END")
+        if s["nics"]:
+            out("BEGIN amdgpu_host.nic_temperature")
+            for i, t in enumerate(s["nics"][:2]):
+                out(f"SET nic{i} = {int(round(float(t) * 1000))}")
+            out("END")
+
+        smart = collect_smart()
+        if smart:
+            out("BEGIN amdgpu_host.nvme_health")
+            for dim in ("percentage_used", "media_errors", "critical_warning"):
+                if smart.get(dim) is not None:
+                    out(f"SET {dim} = {int(smart[dim])}")
+            out("END")
+
+        flush()
+        time.sleep(max(1.0, UPDATE_EVERY - (time.time() - started)))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    except Exception as exc:  # never die silently - netdata would just show a gap
+        log(f"fatal: {exc!r}")
+        out("DISABLE")
+        flush()
+        sys.exit(1)

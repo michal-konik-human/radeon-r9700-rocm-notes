@@ -1,0 +1,10 @@
+[Unit]
+Description=Run smart-helper every 15 minutes (NVMe SMART changes over days)
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=15min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
