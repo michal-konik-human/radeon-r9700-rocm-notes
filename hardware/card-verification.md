@@ -86,3 +86,47 @@ confirms the link *performs* as x16, not merely that it *reports* x16.
   = 64 CUs. Not a fault.
 - dmesg complaints about HDMI infoframes or `optc31_disable_crtc` — check the PCI address;
   on my box those were the **integrated** GPU's display path, unrelated to the R9700.
+- **A large model "loading" forever, VRAM full, GPU activity stuck at 3-5%** — this is not
+  the card. It's a ROCm bug independent of hardware health — see
+  [rocm-mmap-load-hang.md](../findings/rocm-mmap-load-hang.md).
+
+## Third card, 2026-09-28 (0000:09:00.0)
+
+Same checklist, same result — this card is clean. Numbers differ from the
+`0000:03:00.0` example above only where expected (bus address, idle temps).
+
+**PCIe link (CPU-facing, not the GPU's own immediate link — see
+[pcie-lane-plan.md](pcie-lane-plan.md) for why those differ):**
+```bash
+$ curl -s "http://127.0.0.1:19999/api/v1/data?chart=amdgpu_gpu2.pcie_width&after=-30&points=1"
+8
+```
+x8, same as cards 1 and 2 — not the x4 originally planned for this slot.
+
+**ECC:**
+```bash
+$ amd-smi metric -g 2 --ecc
+    TOTAL_CORRECTABLE_COUNT: 0
+    TOTAL_UNCORRECTABLE_COUNT: 0
+    TOTAL_DEFERRED_COUNT: 0
+```
+
+**AER (all counters, correctable and fatal):**
+```bash
+$ cat /sys/bus/pci/devices/0000:09:00.0/aer_dev_correctable
+$ cat /sys/bus/pci/devices/0000:09:00.0/aer_dev_fatal
+```
+Every field zero on both.
+
+**It enumerates and it computes.** Confirmed by running `gpt-oss-120b` (59 GiB, needs all
+three cards) split across all three with `-sm layer -ts 1,1,1`: real generation at
+89-96 tok/s, VRAM split evenly (22.7/20.1/19.0 GiB). This card's own health was never in
+question — the thing that initially looked like a hardware/capacity problem on this card
+turned out to be a ROCm software bug affecting all three cards equally, see
+[rocm-mmap-load-hang.md](../findings/rocm-mmap-load-hang.md).
+
+**Netdata/alerting coverage:** confirmed automatic, zero config changes. The health rules
+in `monitoring/health.d-amdgpu.conf` are `template:` rules bound to a chart *context*
+(`amdgpu.*`), not a specific instance name — the moment `amdgpu_gpu2`'s charts appeared,
+all 10 alarm rules (temperature ×3, ECC ×2, AER ×3, cooling_fault, pcie_width_degraded)
+attached to it automatically, same as gpu0/gpu1.
