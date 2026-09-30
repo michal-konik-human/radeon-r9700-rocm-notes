@@ -6,7 +6,7 @@ Benchmark numbers, monitoring that actually works, and the traps that cost me ti
 Everything here is measured on real hardware, not estimated. Where I got something wrong,
 the wrong answer is left in with the correction — those entries are usually the useful ones.
 
-Companion repo: **[llm-bench-harness](https://github.com/<you>/llm-bench-harness)** — the
+Companion repo: **[llm-bench-harness](https://github.com/michal-konik-human/llm-bench-harness)** — the
 measurement tooling these numbers come from.
 
 ---
@@ -19,7 +19,7 @@ measurement tooling these numbers come from.
 | Board | Gigabyte B850 AI TOP (AM5) |
 | CPU / RAM | Ryzen 7 9700X · 64 GB DDR5-6000 |
 | OS | Ubuntu 24.04.5, kernel 7.0 · ROCm 7.2.4 (in-tree `amdgpu`, no DKMS) |
-| Target | 4 cards / 128 GB VRAM — **currently 1 card installed**, the rest in transit |
+| Cards | **4 × R9700 = 128 GB VRAM**, PCIe x8 / x4 / x8 / x4 Gen5 (two slots + two M.2 risers), 250 W cap each (since 30 Sep 2026) |
 
 ---
 
@@ -50,6 +50,21 @@ rest. A 63 GB model on one 32 GB card measures PCIe transfer, not the GPU.
 
 ---
 
+## Benchmarks — four cards, 128 GB (30 Sep 2026)
+
+`-sm layer -ts 1/1/1/1 --load-mode dio`, 250 W cap per card, `llama.cpp 680a036`, llama.cpp
+default batch sizes, 3 independent processes each:
+
+| Model | Size | prefill `pp512` | prefill `pp4096` | decode `tg128` | Spread |
+|---|---|---:|---:|---:|---:|
+| Qwen3-235B-A22B UD-Q3_K_XL (MoE 128/8) | 96.6 GiB | 619 | 583 | **32.7** | ≤ 1.0 % |
+| DeepSeek-V4-Flash UD-IQ3_XXS (MoE 256/6) | 95.9 GiB | 517 | **1020** | **24.0** | ≤ 2.7 % |
+
+With a tuned `--ubatch-size` (see below) prompt processing reaches 894 and 1135 tok/s.
+Summed GPU power while doing this: ~400–490 W, not 1000 W — [why](findings/layer-split-power.md).
+
+---
+
 ## Findings — start here
 
 These are the entries that would have saved me time. Each one is short and self-contained.
@@ -70,6 +85,9 @@ These are the entries that would have saved me time. Each one is short and self-
 | [`adding a GPU renames your NICs`](findings/pci-renumbering.md) | PCI renumbering shifts every downstream device. Stale interface names return **empty**, not an error — which reads as "no cable" |
 | [`power cap floor is 210 W`](findings/power-cap-floor.md) | `MIN_POWER_LIMIT: 210 W`. 200 W is not settable at all |
 | [`the 19 W that wasn't`](findings/short-test-telemetry-artifact.md) | My own measurement bug: a fast MoE model's compute window is shorter than the telemetry sampling period |
+| [`the card always says x16`](findings/pcie-endpoint-reports-x16.md) | The R9700 has its own PCIe switch; the GPU endpoint is always x16. The real slot link (x8 / x4) is at the root port |
+| [`-ts 1,1,1,1 in llama-bench`](findings/llama-bench-tensor-split-syntax.md) | `llama-bench` separates the split with `/`; a comma is a sweep = whole model on GPU 0. Cost two days and a fake "multi-GPU bug" |
+| [`one space breaks tool calling`](findings/tool-call-template-space.md) | llama.cpp derives the tool-call parser from the chat template; a model writing one extra space gets plain text back |
 
 ### Platform / assembly
 
@@ -81,12 +99,16 @@ These are the entries that would have saved me time. Each one is short and self-
 | [`ROCm install, and skipping DKMS`](hardware/rocm-install.md) | Kernel 7.0 has in-tree gfx1201 support; DKMS is a risk, not a requirement. Plus a package in the official guide that doesn't exist |
 | [`card 1 verification`](hardware/card-verification.md) | What to check after seating a card, and what good looks like |
 | [`sustained inference thermals`](hardware/thermals.md) | Real inference is a heavier load than a synthetic stress test |
+| [`fan control needs overdrive`](findings/fan-control-requires-overdrive.md) | Stock curve: 100–110 °C junction on 4 cards at 40–57 % fan. No fan control on RDNA4 without `ppfeaturemask` bit 0x4000; with it: 81–83 °C, quiet at idle. Script in [`tuning/`](tuning/) |
 
-### Multi-GPU (not yet measured — collected for when the cards arrive)
+### Multi-GPU (measured on 4 cards, 28–30 Sep 2026)
 
 | Finding | One-line summary |
 |---|---|
 | [`no XGMI on this card`](findings/multi-gpu-notes.md) | Every byte between cards crosses PCIe. P2P is documented to hang a 4-card host. `NCCL_PROTO=Simple` and `NCCL_P2P_DISABLE=1` are mandatory |
+| [`ROCm mmap load hang`](findings/rocm-mmap-load-hang.md) | Models ≳ 50 GiB hang forever on load; `--load-mode dio` fixes it — independent of GPU count |
+| [`ubatch per model`](findings/ubatch-per-model.md) | Default 512 was never best: +57 % (Qwen3-235B) … +4 % (dense), and 4096 costs DeepSeek −58 % |
+| [`layer split power`](findings/layer-split-power.md) | 4 × 250 W cards draw ~470 W on a 235B model; the last card in the chain works hardest |
 
 ---
 
@@ -130,7 +152,7 @@ different weeks.
 ## Corrections welcome
 
 If you have numbers that contradict these, open an issue — especially on multi-GPU, where
-I have collected reports but measured nothing yet.
+the numbers above are from one machine.
 
 ## License
 
