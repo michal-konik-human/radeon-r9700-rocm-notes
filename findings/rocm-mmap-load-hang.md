@@ -55,6 +55,12 @@ completes in **~20 seconds** and generates real tokens (89-96 tok/s on 3×R9700,
   AER, ECC) was independently verified clean — see
   [card-verification.md](../hardware/card-verification.md). The hang is a software/driver
   issue, orthogonal to hardware condition.
+> **Correction, 30 Sep 2026:** the "second, distinct bug" below does not exist. The configs
+> passed `-ts 1,1,1` to `llama-bench`, where a comma means *sweep* (three tests with split `1` =
+> everything on GPU 0). With `-ts 1/1/1/1` the same models load and run with `--load-mode dio`
+> on 4 GPUs. See [`llama-bench-tensor-split-syntax.md`](llama-bench-tensor-split-syntax.md).
+> The original text is kept below.
+
 - **`llama-bench --load-mode dio` fails immediately, `llama-cli` with the identical flags
   works.** `llama-bench` reports `error: failed to load model` in under a second (not a
   hang) as soon as more than one GPU is visible with this same model + `dio`. Single-GPU
