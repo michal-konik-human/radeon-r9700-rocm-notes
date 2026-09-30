@@ -1,0 +1,12 @@
+[Unit]
+Description=R9700 GPU tuning: 250 W power limit + aggressive fan curve
+After=systemd-modules-load.service
+Before=llama-swap.service netdata.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/gpu-tuning.sh apply
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -130,3 +130,13 @@ in `monitoring/health.d-amdgpu.conf` are `template:` rules bound to a chart *con
 (`amdgpu.*`), not a specific instance name — the moment `amdgpu_gpu2`'s charts appeared,
 all 10 alarm rules (temperature ×3, ECC ×2, AER ×3, cooling_fault, pcie_width_degraded)
 attached to it automatically, same as gpu0/gpu1.
+
+
+## Cards 3 and 4 (28–30 Sep 2026)
+
+Both on M.2 → PCIe risers (ADT-Link F43SG). Verified under a 4-card load: AER 0/0/0 on each
+GPU **and on every link above it**, ECC 0, 32 GB BAR, and the links at the **root port**:
+x8 / x4 / x8 / x4 Gen5 for `03:00.0` / `06:00.0` / `09:00.0` / `19:00.0`. The GPU endpoint
+reports x16 on every card — [why](../findings/pcie-endpoint-reports-x16.md). After each card
+went in, the Ethernet interfaces were renamed again; after card 4 the wired link did not come
+back on its own ([`pci-renumbering.md`](../findings/pci-renumbering.md)).
