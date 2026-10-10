@@ -6,8 +6,11 @@ Benchmark numbers, monitoring that actually works, and the traps that cost me ti
 Everything here is measured on real hardware, not estimated. Where I got something wrong,
 the wrong answer is left in with the correction — those entries are usually the useful ones.
 
-Companion repo: **[llm-bench-harness](https://github.com/michal-konik-human/llm-bench-harness)** — the
-measurement tooling these numbers come from.
+Companion repos:
+- **[local-llm-perf-bench](https://github.com/michal-konik-human/local-llm-perf-bench)**: the speed
+  measurement tooling these numbers come from (formerly `llm-bench-harness`).
+- **[local-llm-quality-bench](https://github.com/michal-konik-human/local-llm-quality-bench)**: how *good*
+  the same models are as agents and assistants, in Polish and English.
 
 ---
 

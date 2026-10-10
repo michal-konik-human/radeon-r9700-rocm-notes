@@ -1,6 +1,6 @@
 # Benchmark results — Radeon AI PRO R9700, one card
 
-All numbers measured with [llm-bench-harness](https://github.com/<you>/llm-bench-harness),
+All numbers measured with [local-llm-perf-bench](https://github.com/michal-konik-human/local-llm-perf-bench) (formerly `llm-bench-harness`),
 which records the conditions alongside every result. **Three independent OS processes per
 model**, not `llama-bench -r 3` — [why](../findings/bimodal-throughput.md).
 
@@ -111,13 +111,14 @@ with context length.
 - **The cost of the 210 W cap** — config exists, run pending.
 - **x16 → x8** once a second card is installed. Will be measured, not assumed.
 - **Multi-GPU anything.** [Collected notes](../findings/multi-gpu-notes.md), no measurements.
-- **Answer quality.** Throughput says nothing about whether the output is usable.
+- **Answer quality.** Throughput says nothing about whether the output is usable. That is measured by
+  [local-llm-quality-bench](https://github.com/michal-konik-human/local-llm-quality-bench).
 
 ## Reproducing this
 
 ```bash
-git clone https://github.com/<you>/llm-bench-harness.git
-cd llm-bench-harness
+git clone https://github.com/michal-konik-human/local-llm-perf-bench.git
+cd local-llm-perf-bench
 bench-model <your-model>
 ```
 

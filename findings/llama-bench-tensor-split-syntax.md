@@ -20,5 +20,5 @@ tests with split `1` — all layers on GPU 0 — which cannot load a 96 GiB mode
 
 **Knock-on:** measurements taken with the `llama-cli` workaround understated prompt processing
 heavily (a 3-card Qwen3-235B Q2 run logged ~42 tok/s; the properly measured 4-card Q3 run does
-619 tok/s pp512). `llm-bench-harness` now converts a comma `-ts` to slashes and rejects other
+619 tok/s pp512). `local-llm-perf-bench` (formerly `llm-bench-harness`) now converts a comma `-ts` to slashes and rejects other
 sweeps before running anything.
