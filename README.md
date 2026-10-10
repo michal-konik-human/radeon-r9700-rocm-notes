@@ -1,18 +1,25 @@
 # Radeon AI PRO R9700 + ROCm — field notes
 
 Running local LLMs on **RDNA4 / gfx1201** under ROCm, on a consumer AM5 platform.
-Benchmark numbers, monitoring that actually works, and the traps that cost me time.
+How to make the hardware work, monitoring and tuning that actually work, and the traps that cost me time.
+Benchmark numbers live in [local-llm-bench-results](https://github.com/michal-konik-human/local-llm-bench-results).
 
 Everything here is measured on real hardware, not estimated. Where I got something wrong,
 the wrong answer is left in with the correction — those entries are usually the useful ones.
 
-Companion repos:
-- **[local-llm-perf-bench](https://github.com/michal-konik-human/local-llm-perf-bench)**: the speed
-  measurement tooling these numbers come from (formerly `llm-bench-harness`).
-- **[local-llm-quality-bench](https://github.com/michal-konik-human/local-llm-quality-bench)**: how *good*
-  the same models are as agents and assistants, in Polish and English.
 
 ---
+
+## Project map
+
+Four repos, one job each:
+
+| Repo | What it is | It changes when… |
+|---|---|---|
+| [local-llm-perf-bench](https://github.com/michal-konik-human/local-llm-perf-bench) | **Tool**: how fast a model runs (llama.cpp, any GGUF, 1–n GPUs) | the way speed is measured changes |
+| [local-llm-quality-bench](https://github.com/michal-konik-human/local-llm-quality-bench) | **Tool**: how good a model is as an agent/assistant, in Polish and English | cases, scorers or model profiles change |
+| [local-llm-bench-results](https://github.com/michal-konik-human/local-llm-bench-results) | **Data**: everything measured on the reference rig, quality next to speed | a benchmark run finishes |
+| [radeon-r9700-rocm-notes](https://github.com/michal-konik-human/radeon-r9700-rocm-notes) | **Platform**: making 4× Radeon AI PRO R9700 + ROCm work (setup, traps, monitoring, tuning) | hardware, drivers or the serving stack change, or a new trap is found |
 
 ## Hardware
 
@@ -26,45 +33,15 @@ Companion repos:
 
 ---
 
-## Benchmarks — one card, 32 GB
+## Benchmark numbers
 
-Stock 300 W cap, x16 Gen5, `llama.cpp 987498f`, ROCm 7.2.4, **3 independent processes** per
-model (not `-r 3` — see [why](findings/bimodal-throughput.md)).
+All measurements of this machine (speed and quality, with their conditions and transcripts) are in
+**[local-llm-bench-results](https://github.com/michal-konik-human/local-llm-bench-results)**. Two platform facts that came out of them:
 
-| Model | Weights in VRAM | prefill `pp512` | decode `tg128` | Spread |
-|---|---|---|---|---|
-| gpt-oss-20b MXFP4 (MoE) | 11.3 GiB | **6050** tok/s | **149.9** tok/s | 0.2 % |
-| Qwen3-32B Q4_K_M (dense) | 18.4 GiB | **1030** tok/s | **27.98** tok/s | 0.0 % |
-
-**MoE decodes 5.4× faster.** Not because it's a better model — decode is memory-bandwidth
-bound, and MoE reads a fraction of the weights per token.
-
-Longer runs (`-p 4096 -n 1024`):
-
-| Model | prefill | decode | Peak junction | Peak power |
-|---|---|---|---|---|
-| gpt-oss-20b | 5792 tok/s | 150.7 tok/s | 57 °C | **288 W** |
-| Qwen3-32B | 1005 tok/s | 27.9 tok/s | 83 °C+ | **300 W** |
-
-Full data with recorded conditions: [`results/`](results/).
-
-**Practical VRAM ceiling on one card is ~24 GB of weights**, not 32 — KV cache needs the
-rest. A 63 GB model on one 32 GB card measures PCIe transfer, not the GPU.
-
----
-
-## Benchmarks — four cards, 128 GB (30 Sep 2026)
-
-`-sm layer -ts 1/1/1/1 --load-mode dio`, 250 W cap per card, `llama.cpp 680a036`, llama.cpp
-default batch sizes, 3 independent processes each:
-
-| Model | Size | prefill `pp512` | prefill `pp4096` | decode `tg128` | Spread |
-|---|---|---:|---:|---:|---:|
-| Qwen3-235B-A22B UD-Q3_K_XL (MoE 128/8) | 96.6 GiB | 619 | 583 | **32.7** | ≤ 1.0 % |
-| DeepSeek-V4-Flash UD-IQ3_XXS (MoE 256/6) | 95.9 GiB | 517 | **1020** | **24.0** | ≤ 2.7 % |
-
-With a tuned `--ubatch-size` (see below) prompt processing reaches 894 and 1135 tok/s.
-Summed GPU power while doing this: ~400–490 W, not 1000 W — [why](findings/layer-split-power.md).
+- **The practical VRAM ceiling on one 32 GB card is ~24 GB of weights.** The KV cache needs the rest, and a
+  model that spills to host RAM measures PCIe, not the GPU.
+- **Four 250 W cards running one model with a layer split draw ~400–490 W in total, not 1 000 W.**
+  Only one card computes at a time; see [layer-split power](findings/layer-split-power.md).
 
 ---
 
@@ -143,14 +120,10 @@ It's specific to AMD + netdata but not to this card. See [`monitoring/README.md`
 
 ## A note on method
 
-Every number here was produced by a harness that records the conditions alongside the
-result: `llama.cpp` commit and build flags, ROCm version, power cap, PCIe link width read
-*under load*, peak temperatures, the exact environment variables used, and ECC/AER counters
-before and after. If the error counters moved during a run, the result was discarded rather
-than adjusted.
-
-That sounds like overkill until the first time you try to compare two numbers from
-different weeks.
+The measurements behind these notes were made with
+[local-llm-perf-bench](https://github.com/michal-konik-human/local-llm-perf-bench), which records the conditions next to every
+number (llama.cpp commit, ROCm, power cap, PCIe link under load, temperatures, ECC/AER before and after) and
+discards runs whose error counters moved.
 
 ## Corrections welcome
 
