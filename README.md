@@ -2,7 +2,7 @@
 
 Running local LLMs on **RDNA4 / gfx1201** under ROCm, on a consumer AM5 platform.
 How to make the hardware work, monitoring and tuning that actually work, and the traps that cost me time.
-Benchmark numbers live in [local-llm-bench-results](https://github.com/michal-konik-human/local-llm-bench-results).
+Benchmark numbers live in [local-llm-bench-results](https://github.com/michal-koniu/local-llm-bench-results).
 
 Everything here is measured on real hardware, not estimated. Where I got something wrong,
 the wrong answer is left in with the correction — those entries are usually the useful ones.
@@ -16,10 +16,10 @@ Four repos, one job each:
 
 | Repo | What it is | It changes when… |
 |---|---|---|
-| [local-llm-perf-bench](https://github.com/michal-konik-human/local-llm-perf-bench) | **Tool**: how fast a model runs (llama.cpp, any GGUF, 1–n GPUs) | the way speed is measured changes |
-| [local-llm-quality-bench](https://github.com/michal-konik-human/local-llm-quality-bench) | **Tool**: how good a model is as an agent/assistant, in Polish and English | cases, scorers or model profiles change |
-| [local-llm-bench-results](https://github.com/michal-konik-human/local-llm-bench-results) | **Data**: everything measured on the reference rig, quality next to speed | a benchmark run finishes |
-| [radeon-r9700-rocm-notes](https://github.com/michal-konik-human/radeon-r9700-rocm-notes) | **Platform**: making 4× Radeon AI PRO R9700 + ROCm work (setup, traps, monitoring, tuning) | hardware, drivers or the serving stack change, or a new trap is found |
+| [local-llm-perf-bench](https://github.com/michal-koniu/local-llm-perf-bench) | **Tool**: how fast a model runs (llama.cpp, any GGUF, 1–n GPUs) | the way speed is measured changes |
+| [local-llm-quality-bench](https://github.com/michal-koniu/local-llm-quality-bench) | **Tool**: how good a model is as an agent/assistant, in Polish and English | cases, scorers or model profiles change |
+| [local-llm-bench-results](https://github.com/michal-koniu/local-llm-bench-results) | **Data**: everything measured on the reference rig, quality next to speed | a benchmark run finishes |
+| [radeon-r9700-rocm-notes](https://github.com/michal-koniu/radeon-r9700-rocm-notes) | **Platform**: making 4× Radeon AI PRO R9700 + ROCm work (setup, traps, monitoring, tuning) | hardware, drivers or the serving stack change, or a new trap is found |
 
 ## Hardware
 
@@ -36,7 +36,7 @@ Four repos, one job each:
 ## Benchmark numbers
 
 All measurements of this machine (speed and quality, with their conditions and transcripts) are in
-**[local-llm-bench-results](https://github.com/michal-konik-human/local-llm-bench-results)**. Two platform facts that came out of them:
+**[local-llm-bench-results](https://github.com/michal-koniu/local-llm-bench-results)**. Two platform facts that came out of them:
 
 - **The practical VRAM ceiling on one 32 GB card is ~24 GB of weights.** The KV cache needs the rest, and a
   model that spills to host RAM measures PCIe, not the GPU.
@@ -121,7 +121,7 @@ It's specific to AMD + netdata but not to this card. See [`monitoring/README.md`
 ## A note on method
 
 The measurements behind these notes were made with
-[local-llm-perf-bench](https://github.com/michal-konik-human/local-llm-perf-bench), which records the conditions next to every
+[local-llm-perf-bench](https://github.com/michal-koniu/local-llm-perf-bench), which records the conditions next to every
 number (llama.cpp commit, ROCm, power cap, PCIe link under load, temperatures, ECC/AER before and after) and
 discards runs whose error counters moved.
 
